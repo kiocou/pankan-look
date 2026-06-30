@@ -11,7 +11,7 @@ mod utils;
 
 use crate::db::Db;
 use crate::models::*;
-use crate::player::{mpv_embed, EmbedConfig, PlayerState};
+use crate::player::mpv_embed;
 use crate::providers::guangya::{self, GuangyaConfig};
 use crate::providers::local::LocalProvider;
 use crate::providers::openlist::OpenListProvider;
@@ -26,9 +26,13 @@ use tauri::{AppHandle, Manager, State};
 
 pub struct AppState {
     pub db: Arc<Db>,
-    pub providers: Arc<RwLock<HashMap<String, Box<dyn CloudProvider>>>>,
+    pub providers: Arc<RwLock<HashMap<String, Arc<dyn CloudProvider>>>>,
     pub active_provider: Arc<RwLock<Option<String>>>,
     pub scanner_running: Arc<RwLock<bool>>,
+    /// 上次扫描结果缓存, library_list_items 直接读这里,避免每次打开媒体库都重扫
+    pub library_cache: Arc<RwLock<Vec<LibraryItem>>>,
+    /// NSFW 库缓存, nsfw_list_items 直接读这里
+    pub nsfw_cache: Arc<RwLock<Vec<NsfwItem>>>,
 }
 
 impl AppState {
@@ -41,12 +45,14 @@ impl AppState {
             providers,
             active_provider: Arc::new(RwLock::new(None)),
             scanner_running: Arc::new(RwLock::new(false)),
+            library_cache: Arc::new(RwLock::new(Vec::new())),
+            nsfw_cache: Arc::new(RwLock::new(Vec::new())),
         })
     }
 
     pub fn reload_providers_from_db(
         db: &Db,
-        providers: &Arc<RwLock<HashMap<String, Box<dyn CloudProvider>>>>,
+        providers: &Arc<RwLock<HashMap<String, Arc<dyn CloudProvider>>>>,
     ) -> Result<(), String> {
         let mut map = providers.write();
         map.clear();
@@ -59,33 +65,33 @@ impl AppState {
                             if let Some(stored) = db.get_device_fingerprint("guangya")? {
                                 let mut c = cfg.clone();
                                 c.device_id = stored;
-                                map.insert(pid, Box::new(providers::guangya::GuangyaProvider::new(c)));
+                                map.insert(pid, Arc::new(providers::guangya::GuangyaProvider::new(c)));
                                 continue;
                             } else {
                                 let did = crate::utils::generate_device_id();
                                 let _ = db.save_device_fingerprint("guangya", &did);
                                 let mut c = cfg.clone();
                                 c.device_id = did;
-                                map.insert(pid, Box::new(providers::guangya::GuangyaProvider::new(c)));
+                                map.insert(pid, Arc::new(providers::guangya::GuangyaProvider::new(c)));
                                 continue;
                             }
                         }
-                        map.insert(pid, Box::new(providers::guangya::GuangyaProvider::new(cfg)));
+                        map.insert(pid, Arc::new(providers::guangya::GuangyaProvider::new(cfg)));
                     }
                 }
                 "openlist" => {
                     if let Ok(cfg) = serde_json::from_value::<providers::openlist::OpenListConfig>(v) {
-                        map.insert(pid, Box::new(OpenListProvider::new(cfg)));
+                        map.insert(pid, Arc::new(OpenListProvider::new(cfg)));
                     }
                 }
                 "webdav" => {
                     if let Ok(cfg) = serde_json::from_value::<providers::webdav::WebDavConfig>(v) {
-                        map.insert(pid, Box::new(WebDavProvider::new(cfg)));
+                        map.insert(pid, Arc::new(WebDavProvider::new(cfg)));
                     }
                 }
                 "local" => {
                     if let Ok(cfg) = serde_json::from_value::<providers::local::LocalConfig>(v) {
-                        map.insert(pid, Box::new(LocalProvider::new(cfg)));
+                        map.insert(pid, Arc::new(LocalProvider::new(cfg)));
                     }
                 }
                 _ => {}
@@ -95,12 +101,13 @@ impl AppState {
     }
 }
 
-fn get_provider<'a>(
-    state: &'a State<'_, AppState>,
+fn get_provider(
+    state: &State<'_, AppState>,
     provider_id: &str,
-) -> Result<&'a Box<dyn CloudProvider>, String> {
+) -> Result<Arc<dyn CloudProvider>, String> {
     let map = state.providers.read();
     map.get(provider_id)
+        .cloned()
         .ok_or_else(|| format!("provider {} 不存在", provider_id))
 }
 
@@ -215,12 +222,12 @@ async fn guangya_init_captcha(phone: String) -> Result<guangya::GuangyaCaptcha, 
 
 #[tauri::command]
 async fn guangya_send_code(
-    captcha_key: String,
     phone: String,
-    captcha_code: String,
     device_id: String,
 ) -> Result<guangya::SendCodeResult, String> {
-    guangya::send_code(&captcha_key, &phone, &captcha_code, &device_id).await
+    // 自动调 init_captcha 拿 captcha_token, 再发验证码
+    let cap = guangya::init_captcha(&phone, &device_id).await?;
+    guangya::send_code(&phone, &cap.captcha_token, &device_id).await
 }
 
 #[tauri::command]
@@ -231,7 +238,9 @@ async fn guangya_verify_code(
     provider_id: String,
     device_id: String,
 ) -> Result<Value, String> {
-    let r = guangya::verify_code(&verification_id, &phone, &code, &device_id).await?;
+    // 拆成两步: verify_code 拿 verification_token → signin 拿 access_token
+    let vt = guangya::verify_code(&verification_id, &phone, &code, &device_id).await?;
+    let r = guangya::signin(&phone, &vt, &code, &device_id).await?;
     Ok(json!({
         "access_token": r.access_token,
         "refresh_token": r.refresh_token,
@@ -241,48 +250,29 @@ async fn guangya_verify_code(
     }))
 }
 
-// ===== Embed MPV =====
+// ===== External MPV =====
+// 前端点击"播放"调此命令：Rust 拿真正的播放地址（解析 provider header/签名等），
+// 然后拉起外部 mpv。mpv 不可用时回退到系统默认播放器。
 #[tauri::command]
-fn embed_mpv_start(url: String, title: Option<String>, start_position: Option<f64>) -> Result<(), String> {
-    mpv_embed::set_pending_embed(EmbedConfig {
-        url,
-        title,
-        start_position,
-        auto_play: true,
-    });
-    Ok(())
+async fn open_with_mpv(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    provider_id: String,
+    path: String,
+) -> Result<(), String> {
+    let p = get_provider(&state, &provider_id)?;
+    let info = p.get_player_info(&path).await?;
+    let url = info
+        .play_url
+        .or(info.download_url)
+        .unwrap_or(info.url);
+    mpv_embed::open_with_external_mpv(&app, &url)
 }
 
 #[tauri::command]
-async fn embed_mpv_attach(app: AppHandle, label: String) -> Result<(), String> {
-    mpv_embed::attach_mpv_window(&app, &label).await
+fn open_url_with_mpv(app: AppHandle, url: String) -> Result<(), String> {
+    mpv_embed::open_with_external_mpv(&app, &url)
 }
-
-#[tauri::command]
-fn embed_mpv_stop() -> Result<(), String> {
-    mpv_embed::stop_external_mpv()
-}
-
-#[tauri::command]
-fn embed_mpv_resize(_w: f64, _h: f64) -> Result<(), String> { Ok(()) }
-
-#[tauri::command]
-fn embed_mpv_toggle_pause() -> Result<PlayerState, String> { Ok(mpv_embed::toggle_pause()) }
-
-#[tauri::command]
-fn embed_mpv_seek(seconds: f64) -> Result<PlayerState, String> { Ok(mpv_embed::seek(seconds)) }
-
-#[tauri::command]
-fn embed_mpv_set_volume(volume: f32) -> Result<PlayerState, String> { Ok(mpv_embed::set_volume(volume)) }
-
-#[tauri::command]
-fn embed_mpv_set_mute(mute: bool) -> Result<PlayerState, String> { Ok(mpv_embed::set_mute(mute)) }
-
-#[tauri::command]
-fn embed_mpv_set_speed(speed: f32) -> Result<PlayerState, String> { Ok(mpv_embed::set_speed(speed)) }
-
-#[tauri::command]
-fn embed_mpv_get_state() -> Result<PlayerState, String> { Ok(mpv_embed::get_state()) }
 
 // ===== Provider management =====
 #[tauri::command]
@@ -310,20 +300,20 @@ async fn add_provider(
         }
         state.providers.write().insert(
             provider_id.clone(),
-            Box::new(providers::guangya::GuangyaProvider::new(cfg)),
+            Arc::new(providers::guangya::GuangyaProvider::new(cfg)),
         );
     } else if provider_id == "openlist" {
         let cfg: providers::openlist::OpenListConfig =
             serde_json::from_value(config).map_err(|e| e.to_string())?;
-        state.providers.write().insert(provider_id, Box::new(OpenListProvider::new(cfg)));
+        state.providers.write().insert(provider_id, Arc::new(OpenListProvider::new(cfg)));
     } else if provider_id == "webdav" {
         let cfg: providers::webdav::WebDavConfig =
             serde_json::from_value(config).map_err(|e| e.to_string())?;
-        state.providers.write().insert(provider_id, Box::new(WebDavProvider::new(cfg)));
+        state.providers.write().insert(provider_id, Arc::new(WebDavProvider::new(cfg)));
     } else if provider_id == "local" {
         let cfg: providers::local::LocalConfig =
             serde_json::from_value(config).map_err(|e| e.to_string())?;
-        state.providers.write().insert(provider_id, Box::new(LocalProvider::new(cfg)));
+        state.providers.write().insert(provider_id, Arc::new(LocalProvider::new(cfg)));
     } else {
         return Err(format!("未知 provider 类型: {}", provider_id));
     }
@@ -513,17 +503,43 @@ fn get_fanart_configured(state: State<'_, AppState>) -> Result<bool, String> {
     Ok(state.db.get_setting("fanart_api_key")?.map(|s| !s.is_empty()).unwrap_or(false))
 }
 
+// ===== Image Proxy (bypass WebView proxy for external CDNs) =====
+#[tauri::command]
+async fn proxy_image(url: String) -> Result<Vec<u8>, String> {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .build()
+        .map_err(|e| format!("proxy_image: client build: {}", e))?;
+    let res = client
+        .get(&url)
+        .send()
+        .await
+        .map_err(|e| format!("proxy_image: fetch {}: {}", url, e))?;
+    let status = res.status();
+    if !status.is_success() {
+        return Err(format!("proxy_image: HTTP {} for {}", status, url));
+    }
+    let bytes = res
+        .bytes()
+        .await
+        .map_err(|e| format!("proxy_image: read body: {}", e))?;
+    Ok(bytes.to_vec())
+}
+
 // ===== Episode parsing =====
 #[tauri::command]
 fn parse_episode_filename(name: String) -> Result<Value, String> {
     let re_sxe = regex::Regex::new(r"[Ss](\d{1,2})[Ee](\d{1,3})").ok();
     let re_ep_only = regex::Regex::new(r"(?:^|[^0-9])[Ee][Pp]?(\d{1,3})(?:[^0-9]|$)").ok();
     let re_chs = regex::Regex::new(r"第\s*(\d{1,3})\s*[话集]").ok();
+    fn parse_opt(s: Option<regex::Match<'_>>) -> Option<i32> {
+        s.and_then(|m| m.as_str().parse::<i32>().ok())
+    }
     if let Some(re) = re_sxe {
         if let Some(c) = re.captures(&name) {
             return Ok(json!({
-                "season": c.get(1).and_then(|m| m.as_str()).and_then(|s| s.parse::<i32>().ok()),
-                "episode": c.get(2).and_then(|m| m.as_str()).and_then(|s| s.parse::<i32>().ok()),
+                "season": parse_opt(c.get(1)),
+                "episode": parse_opt(c.get(2)),
             }));
         }
     }
@@ -531,7 +547,7 @@ fn parse_episode_filename(name: String) -> Result<Value, String> {
         if let Some(c) = re.captures(&name) {
             return Ok(json!({
                 "season": 1,
-                "episode": c.get(1).and_then(|m| m.as_str()).and_then(|s| s.parse::<i32>().ok()),
+                "episode": parse_opt(c.get(1)),
             }));
         }
     }
@@ -539,7 +555,7 @@ fn parse_episode_filename(name: String) -> Result<Value, String> {
         if let Some(c) = re.captures(&name) {
             return Ok(json!({
                 "season": 1,
-                "episode": c.get(1).and_then(|m| m.as_str()).and_then(|s| s.parse::<i32>().ok()),
+                "episode": parse_opt(c.get(1)),
             }));
         }
     }
@@ -618,27 +634,64 @@ fn nsfw_source_blur(name: String) -> Result<String, String> {
     Ok(safety::blur_source(&name))
 }
 
+// ===== Scan folder config =====
+const SCAN_FOLDERS_LIBRARY_KEY: &str = "scan_folders_library";
+const SCAN_FOLDERS_NSFW_KEY: &str = "scan_folders_nsfw";
+
+fn scan_folders_key(scope: &str) -> &'static str {
+    match scope {
+        scanner::SCOPE_NSFW => SCAN_FOLDERS_NSFW_KEY,
+        _ => SCAN_FOLDERS_LIBRARY_KEY,
+    }
+}
+
+#[tauri::command]
+async fn get_scan_folders(
+    state: State<'_, AppState>,
+    scope: String,
+) -> Result<Vec<ScanFolder>, String> {
+    let raw = state
+        .db
+        .get_setting(scan_folders_key(&scope))?
+        .unwrap_or_default();
+    if raw.is_empty() {
+        return Ok(Vec::new());
+    }
+    let v: Value = serde_json::from_str(&raw).unwrap_or(Value::Null);
+    let arr = v.as_array().cloned().unwrap_or_default();
+    let mut out = Vec::new();
+    for it in arr {
+        if let Ok(sf) = serde_json::from_value::<ScanFolder>(it) {
+            out.push(sf);
+        }
+    }
+    Ok(out)
+}
+
+#[tauri::command]
+async fn set_scan_folders(
+    state: State<'_, AppState>,
+    scope: String,
+    folders: Vec<ScanFolder>,
+) -> Result<(), String> {
+    let s = serde_json::to_string(&folders).map_err(|e| e.to_string())?;
+    state.db.save_setting(scan_folders_key(&scope), &s)?;
+    Ok(())
+}
+
 // ===== Library =====
 #[tauri::command]
 async fn library_list_items(
     state: State<'_, AppState>,
     provider_id: Option<String>,
 ) -> Result<Vec<LibraryItem>, String> {
-    let map = state.providers.read();
-    let mut out: Vec<LibraryItem> = Vec::new();
-    let pid_filter = provider_id;
-    for (pid, p) in map.iter() {
-        if let Some(filter) = &pid_filter {
-            if filter != pid {
-                continue;
-            }
-        }
-        match scanner::scan_provider(p.as_ref(), pid).await {
-            Ok(items) => out.extend(items),
-            Err(_) => {}
-        }
+    // 直接返回上次扫描的缓存, 避免每次打开媒体库都触发 8 层递归扫描
+    let cache = state.library_cache.read().clone();
+    if let Some(pid) = provider_id {
+        Ok(cache.into_iter().filter(|i| i.provider_id == pid).collect())
+    } else {
+        Ok(cache)
     }
-    Ok(out)
 }
 
 #[tauri::command]
@@ -652,7 +705,22 @@ async fn library_get_series_episodes(
 }
 
 #[tauri::command]
-async fn library_scan(state: State<'_, AppState>, provider_id: Option<String>) -> Result<Value, String> {
+async fn library_scan(state: State<'_, AppState>, _provider_id: Option<String>) -> Result<Value, String> {
+    // 读配置: 媒体库扫描目录
+    let raw = state
+        .db
+        .get_setting(SCAN_FOLDERS_LIBRARY_KEY)?
+        .unwrap_or_default();
+    let folders: Vec<ScanFolder> = if raw.is_empty() {
+        Vec::new()
+    } else {
+        serde_json::from_str(&raw).map_err(|e| e.to_string())?
+    };
+    if folders.is_empty() {
+        return Err("请先在设置中配置媒体库扫描目录".into());
+    }
+
+    // RAII: 用 guard 模式确保即使中途 panic 也会释放 running 锁
     {
         let mut running = state.scanner_running.write();
         if *running {
@@ -660,25 +728,140 @@ async fn library_scan(state: State<'_, AppState>, provider_id: Option<String>) -
         }
         *running = true;
     }
-    let map = state.providers.read();
-    let mut all = Vec::new();
-    for (pid, p) in map.iter() {
-        if let Some(ref filter) = provider_id {
-            if filter != pid {
-                continue;
+    let scan_result: Result<Value, String> = async {
+        let provider_map = state.providers.read().clone();
+        let mut all: Vec<LibraryItem> = Vec::new();
+        let mut nsfw_co: Vec<NsfwItem> = Vec::new();
+        let total = folders.len();
+        for (i, sf) in folders.iter().enumerate() {
+            let p = match provider_map.get(&sf.provider_id) {
+                Some(p) => p.clone(),
+                None => {
+                    eprintln!("[library_scan] provider {} 不存在, 跳过", sf.provider_id);
+                    continue;
+                }
+            };
+            scanner::set_progress(ScanProgress {
+                phase: "scan_folder".into(),
+                current: i as u64,
+                total: total as u64,
+                message: Some(sf.name.clone()),
+            });
+            match scanner::scan_folder(
+                p.as_ref(),
+                &sf.provider_id,
+                &sf.folder_id,
+                &sf.name,
+                scanner::SCOPE_LIBRARY,
+            )
+            .await
+            {
+                Ok((mut items, mut side_nsfw)) => {
+                    all.append(&mut items);
+                    nsfw_co.append(&mut side_nsfw);
+                }
+                Err(e) => eprintln!("[library_scan] {} 失败: {}", sf.name, e),
             }
         }
-        if let Ok(items) = scanner::scan_provider(p.as_ref(), pid).await {
-            all.extend(items);
-        }
+        // 跨目录去重
+        let deduped = scanner::dedup_by_title(all);
+        scanner::set_progress(ScanProgress {
+            phase: "done".into(),
+            current: total as u64,
+            total: total as u64,
+            message: Some(format!("扫描完成, 共 {} 项", deduped.len())),
+        });
+        *state.library_cache.write() = deduped.clone();
+        // 合并 NSFW 副产物去重
+        let existing_nsfw = state.nsfw_cache.read().clone();
+        let mut merged = existing_nsfw;
+        merged.append(&mut nsfw_co);
+        let nsfw_deduped = scanner::dedup_nsfw(merged);
+        *state.nsfw_cache.write() = nsfw_deduped;
+        Ok(json!({ "count": deduped.len() }))
     }
+    .await;
+    // 释放锁
     *state.scanner_running.write() = false;
-    Ok(json!({ "count": all.len() }))
+    scan_result
 }
 
 #[tauri::command]
 fn library_scan_progress() -> Result<Value, String> {
     Ok(scanner::progress_json())
+}
+
+// ===== NSFW =====
+#[tauri::command]
+async fn nsfw_list_items(state: State<'_, AppState>) -> Result<Vec<NsfwItem>, String> {
+    Ok(state.nsfw_cache.read().clone())
+}
+
+#[tauri::command]
+async fn nsfw_scan(state: State<'_, AppState>) -> Result<Value, String> {
+    // 读配置: NSFW 扫描目录
+    let raw = state
+        .db
+        .get_setting(SCAN_FOLDERS_NSFW_KEY)?
+        .unwrap_or_default();
+    let folders: Vec<ScanFolder> = if raw.is_empty() {
+        Vec::new()
+    } else {
+        serde_json::from_str(&raw).map_err(|e| e.to_string())?
+    };
+    if folders.is_empty() {
+        return Err("请先在设置中配置 NSFW 扫描目录".into());
+    }
+
+    // 复用同一个 running 锁防止并发
+    {
+        let mut running = state.scanner_running.write();
+        if *running {
+            return Err("扫描已在进行中".into());
+        }
+        *running = true;
+    }
+    let scan_result: Result<Value, String> = async {
+        let provider_map = state.providers.read().clone();
+        let mut all: Vec<NsfwItem> = Vec::new();
+        let total = folders.len();
+        for (i, sf) in folders.iter().enumerate() {
+            let p = match provider_map.get(&sf.provider_id) {
+                Some(p) => p.clone(),
+                None => continue,
+            };
+            scanner::set_progress(ScanProgress {
+                phase: "scan_nsfw".into(),
+                current: i as u64,
+                total: total as u64,
+                message: Some(sf.name.clone()),
+            });
+            match scanner::scan_folder(
+                p.as_ref(),
+                &sf.provider_id,
+                &sf.folder_id,
+                &sf.name,
+                scanner::SCOPE_NSFW,
+            )
+            .await
+            {
+                Ok((_, mut items)) => all.append(&mut items),
+                Err(e) => eprintln!("[nsfw_scan] {} 失败: {}", sf.name, e),
+            }
+        }
+        let deduped = scanner::dedup_nsfw(all);
+        scanner::set_progress(ScanProgress {
+            phase: "done".into(),
+            current: total as u64,
+            total: total as u64,
+            message: Some(format!("扫描完成, 共 {} 项", deduped.len())),
+        });
+        *state.nsfw_cache.write() = deduped.clone();
+        Ok(json!({ "count": deduped.len() }))
+    }
+    .await;
+    *state.scanner_running.write() = false;
+    scan_result
 }
 
 // ===== App =====
@@ -730,17 +913,9 @@ pub fn run() {
             guangya_init_captcha,
             guangya_send_code,
             guangya_verify_code,
-            // Embed MPV
-            embed_mpv_start,
-            embed_mpv_attach,
-            embed_mpv_stop,
-            embed_mpv_resize,
-            embed_mpv_toggle_pause,
-            embed_mpv_seek,
-            embed_mpv_set_volume,
-            embed_mpv_set_mute,
-            embed_mpv_set_speed,
-            embed_mpv_get_state,
+            // External MPV
+            open_with_mpv,
+            open_url_with_mpv,
             // Provider
             add_provider,
             remove_provider,
@@ -768,6 +943,8 @@ pub fn run() {
             get_tmdb_configured,
             set_fanart_api_key,
             get_fanart_configured,
+            // Image proxy
+            proxy_image,
             // Episode
             parse_episode_filename,
             extract_media_title,
@@ -786,6 +963,12 @@ pub fn run() {
             library_get_series_episodes,
             library_scan,
             library_scan_progress,
+            // Scan folders config
+            get_scan_folders,
+            set_scan_folders,
+            // NSFW
+            nsfw_list_items,
+            nsfw_scan,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

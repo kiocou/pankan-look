@@ -4,6 +4,8 @@ import { useAppStore } from "@/stores";
 import { Button } from "@/components/ui/Button";
 import { EmptyState } from "@/components/ui/EmptyState";
 import { useNavigate } from "react-router-dom";
+import { ProxiedImage } from "@/lib/image";
+import { openWithMpv } from "@/lib/tauri";
 
 export function HomePage() {
   const navigate = useNavigate();
@@ -26,8 +28,8 @@ export function HomePage() {
 
   return (
     <div className="flex h-full flex-col gap-6 overflow-auto p-6">
-      {/* Hero */}
-      <div className="relative overflow-hidden rounded-2xl bg-gradient-to-br from-purple-600 via-pink-500 to-orange-400 p-8 text-white shadow-2xl">
+      {/* Hero —— 跟随主题品牌色：dark 下从主红到深红，light 下从主蓝到深蓝 */}
+      <div className="relative overflow-hidden rounded-2xl bg-gradient-to-br from-primary to-primary/50 p-8 text-primary-foreground shadow-2xl">
         <div className="absolute inset-0 bg-black/20" />
         <div className="relative z-10 max-w-2xl">
           <h1 className="text-4xl font-bold">盘盘看</h1>
@@ -83,17 +85,17 @@ export function HomePage() {
                   <button
                     key={h.id}
                     onClick={() =>
-                      navigate(
-                        `/player/${h.provider_id}?path=${encodeURIComponent(h.path)}&t=${h.position}`
+                      openWithMpv(h.provider_id, h.path).catch((e) =>
+                        console.error("open mpv failed", e)
                       )
                     }
                     className="group overflow-hidden rounded-lg border bg-card text-left transition-all hover:scale-105 hover:border-primary/50"
                   >
                     <div className="relative aspect-video overflow-hidden bg-muted">
                       {h.thumbnail ? (
-                        <img src={h.thumbnail} alt={h.name} className="h-full w-full object-cover" />
+                        <ProxiedImage src={h.thumbnail} alt={h.name} className="h-full w-full object-cover" />
                       ) : (
-                        <div className="flex h-full items-center justify-center bg-gradient-to-br from-purple-600 to-pink-500 text-white">
+                        <div className="flex h-full items-center justify-center bg-gradient-to-br from-primary to-primary/60 text-primary-foreground">
                           <Play className="h-8 w-8" />
                         </div>
                       )}
@@ -130,15 +132,15 @@ export function HomePage() {
                   <button
                     key={h.id}
                     onClick={() =>
-                      navigate(
-                        `/player/${h.provider_id}?path=${encodeURIComponent(h.path)}`
+                      openWithMpv(h.provider_id, h.path).catch((e) =>
+                        console.error("open mpv failed", e)
                       )
                     }
                     className="flex w-full items-center gap-3 border-b px-4 py-3 text-left text-sm last:border-b-0 hover:bg-accent"
                   >
                     <div className="flex h-10 w-16 shrink-0 items-center justify-center overflow-hidden rounded bg-muted">
                       {h.thumbnail ? (
-                        <img src={h.thumbnail} className="h-full w-full object-cover" />
+                        <ProxiedImage src={h.thumbnail} className="h-full w-full object-cover" />
                       ) : (
                         <Film className="h-4 w-4 text-muted-foreground" />
                       )}
@@ -171,10 +173,10 @@ export function HomePage() {
                   >
                     <div className="relative aspect-[2/3] overflow-hidden bg-muted">
                       {it.poster ? (
-                        <img src={it.poster} className="h-full w-full object-cover" />
+                        <ProxiedImage src={it.poster} className="h-full w-full object-cover" />
                       ) : (
-                        <div className="flex h-full items-center justify-center bg-gradient-to-br from-purple-600 to-pink-600">
-                          <Film className="h-8 w-8 text-white/80" />
+                        <div className="flex h-full items-center justify-center bg-gradient-to-br from-primary to-primary/50">
+                          <Film className="h-8 w-8 text-primary-foreground/80" />
                         </div>
                       )}
                     </div>

@@ -88,17 +88,6 @@ export interface NsfwCheckResult {
   confidence: number;
 }
 
-export interface PlayerState {
-  playing: boolean;
-  paused: boolean;
-  position: number;
-  duration: number;
-  volume: number;
-  muted: boolean;
-  speed: number;
-  title: string | null;
-}
-
 export interface LibraryItem {
   id: number;
   provider_id: string;
@@ -111,6 +100,34 @@ export interface LibraryItem {
   rating: number | null;
   overview: string | null;
   episode_count: number;
+  /** 归一化标题, 用于跨目录去重 key */
+  title?: string | null;
+  /** 剧集贡献目录 */
+  source_folders?: SourceFolder[];
+}
+
+export interface SourceFolder {
+  provider_id: string;
+  /** 光鸭=fileId, webdav=path */
+  folder_id: string;
+  name: string;
+}
+
+export interface ScanFolder {
+  provider_id: string;
+  folder_id: string;
+  name: string;
+}
+
+export interface NsfwItem {
+  id: number;
+  provider_id: string;
+  file_id: string;
+  name: string;
+  path: string;
+  thumbnail: string | null;
+  size: number;
+  matched_keywords: string[];
 }
 
 export interface GuangyaCaptcha {
@@ -168,14 +185,10 @@ export const guangyaInitCaptcha = (phone: string) =>
   invoke<GuangyaCaptcha>("guangya_init_captcha", { phone });
 
 export const guangyaSendCode = (
-  captchaKey: string,
   phone: string,
-  captchaCode: string,
   deviceId: string
 ) => invoke<GuangyaSendCodeResult>("guangya_send_code", {
-  captchaKey,
   phone,
-  captchaCode,
   deviceId,
 });
 
@@ -193,38 +206,15 @@ export const guangyaVerifyCode = (
   deviceId,
 });
 
-// ===== 嵌入 MPV =====
-export const embedMpvStart = (
-  url: string,
-  title?: string,
-  startPosition?: number
-) => invoke("embed_mpv_start", { url, title, startPosition });
+// ===== 外部 MPV =====
+// 给到 (provider_id, path) → Rust 端取真实播放 URL → 拉起外部 mpv。
+// mpv 不可用时回退到系统默认播放器。
+export const openWithMpv = (providerId: string, path: string) =>
+  invoke<void>("open_with_mpv", { providerId, path });
 
-export const embedMpvAttach = (label: string) =>
-  invoke("embed_mpv_attach", { label });
-
-export const embedMpvStop = () => invoke("embed_mpv_stop");
-
-export const embedMpvResize = (w: number, h: number) =>
-  invoke("embed_mpv_resize", { w, h });
-
-export const embedMpvTogglePause = () =>
-  invoke<PlayerState>("embed_mpv_toggle_pause");
-
-export const embedMpvSeek = (seconds: number) =>
-  invoke<PlayerState>("embed_mpv_seek", { seconds });
-
-export const embedMpvSetVolume = (volume: number) =>
-  invoke<PlayerState>("embed_mpv_set_volume", { volume });
-
-export const embedMpvSetMute = (mute: boolean) =>
-  invoke<PlayerState>("embed_mpv_set_mute", { mute });
-
-export const embedMpvSetSpeed = (speed: number) =>
-  invoke<PlayerState>("embed_mpv_set_speed", { speed });
-
-export const embedMpvGetState = () =>
-  invoke<PlayerState>("embed_mpv_get_state");
+// 已经拿到 URL 的情况下直接拉起（备用）
+export const openUrlWithMpv = (url: string) =>
+  invoke<void>("open_url_with_mpv", { url });
 
 // ===== Provider 管理 =====
 export const addProvider = (providerId: string, config: Record<string, unknown>) =>
@@ -335,7 +325,49 @@ export const libraryScan = (providerId?: string) =>
 export const libraryScanProgress = () =>
   invoke<Record<string, unknown>>("library_scan_progress");
 
+// ===== 扫描目录配置 =====
+export const getScanFolders = (scope: string) =>
+  invoke<ScanFolder[]>("get_scan_folders", { scope });
+
+export const setScanFolders = (scope: string, folders: ScanFolder[]) =>
+  invoke("set_scan_folders", { scope, folders });
+
+// ===== NSFW =====
+export const nsfwScan = () => invoke<{ count: number }>("nsfw_scan");
+
+export const nsfwListItems = () => invoke<NsfwItem[]>("nsfw_list_items");
+
 // ===== 工具函数（前端用） =====
+
+// ===== 图片代理（绕过 WebView2 系统代理） =====
+// 光鸭 CDN 域名在 WebView2 下经常因系统代理失败 (ERR_TUNNEL_CONNECTION_FAILED)
+// 改走后端 reqwest 拿图片数据, 转成 base64 data URL 喂给 <img>
+const _imgProxyCache = new Map<string, string>();
+export async function proxyThumbnail(url: string): Promise<string | null> {
+  if (!url) return null;
+  if (url.startsWith("data:")) return url;
+  if (_imgProxyCache.has(url)) return _imgProxyCache.get(url)!;
+  try {
+    const bytes = await invoke<number[]>("proxy_image", { url });
+    const u8 = new Uint8Array(bytes);
+    // 简单猜 MIME (光鸭 CDN 都是 jpeg/png/webp)
+    const sniff = u8.length >= 4
+      ? (u8[0] === 0xff && u8[1] === 0xd8 ? "image/jpeg"
+       : u8[0] === 0x89 && u8[1] === 0x50 ? "image/png"
+       : u8[0] === 0x52 && u8[1] === 0x49 ? "image/webp"
+       : "image/jpeg")
+      : "image/jpeg";
+    // 用 btoa 拼 base64
+    let bin = "";
+    for (let i = 0; i < u8.length; i++) bin += String.fromCharCode(u8[i]);
+    const dataUrl = `data:${sniff};base64,${btoa(bin)}`;
+    _imgProxyCache.set(url, dataUrl);
+    return dataUrl;
+  } catch (e) {
+    console.warn("proxyThumbnail failed for", url, e);
+    return null;
+  }
+}
 export function isVideoFile(name: string): boolean {
   const exts = ["mp4", "mkv", "avi", "mov", "wmv", "flv", "webm", "m4v", "ts", "m2ts", "mpg", "mpeg"];
   const ext = name.split(".").pop()?.toLowerCase();
